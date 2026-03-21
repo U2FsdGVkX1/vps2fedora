@@ -1,0 +1,224 @@
+#!/usr/bin/env sh
+
+# Copyright 2026, U2FsdGVkX1 <U2FsdGVkX1@gmail.com>
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+set -e
+
+[ "$(id -u)" -ne 0 ] && echo "This script must be run as root" && exit 1
+
+if command -v wget >/dev/null 2>&1; then
+	download() { if [ -n "$2" ]; then wget --header="$2" -qO- "$1"; else wget -qO- "$1"; fi; }
+elif command -v curl >/dev/null 2>&1; then
+	download() { if [ -n "$2" ]; then curl -fsSL -H "$2" "$1"; else curl -fsSL "$1"; fi; }
+else
+	echo "This script needs curl or wget" >&2
+	exit 2
+fi
+
+download_and_extract_bootstrap() {
+	if [ "$version" = "latest" ]; then
+        tags_json=$(download "$mirror/v2/fedora/tags/list")
+		version=$(printf '%s\n' "$tags_json" \
+			| grep -oE "\"[0-9]+-$architecture\"" \
+			| sed "s/\"//g;s/-$architecture//" \
+			| sort -n \
+			| tail -n1 || true)
+		if [ -z "$version" ]; then
+			version=$(printf '%s\n' "$tags_json" \
+				| grep -oE '"[0-9]+"' \
+				| tr -d '"' \
+				| sort -n \
+				| tail -n1 || true)
+		fi
+	fi
+
+	manifest_tag="$version-$architecture"
+	manifest_url="$mirror/v2/fedora/manifests/$manifest_tag"
+	accept_header='Accept: application/vnd.oci.image.manifest.v1+json'
+	manifest_json=$(download "$manifest_url" "$accept_header")
+	if [ -z "$manifest_json" ]; then
+		echo "Could not fetch Fedora manifest: $manifest_tag"
+		exit 1
+	fi
+
+	layers=$(printf '%s' "$manifest_json" \
+		| tr -d '\n' \
+		| sed -n 's/.*"layers":[[]\([^]]*\)[]].*/\1/p')
+	layer_digests=$(printf '%s' "$layers" \
+		| grep -oE '"digest":"sha256:[a-f0-9]+"' \
+		| sed 's/"digest":"//;s/"//')
+	if [ -z "$layer_digests" ]; then
+		echo "Failed to find OCI layers in manifest"
+		exit 1
+	fi
+
+	mkdir -p /fedora
+	for digest in $layer_digests; do
+		download "$mirror/v2/fedora/blobs/$digest" > "$digest"
+                gzip -dc "$digest" 2>/dev/null | tar -xpf - -C /fedora
+		rm -f "$digest"
+	done
+
+	if grep -E "^nameserver\s+127\." /etc/resolv.conf >/dev/null 2>&1; then
+		echo "nameserver 8.8.8.8" > /fedora/etc/resolv.conf
+	else
+		cp -Lp /etc/resolv.conf /fedora/etc
+	fi
+	ld=$(find /fedora/lib /fedora/lib64 /fedora/usr/lib /fedora/usr/lib64 -name 'ld-linux*.so*' -print -quit)
+
+	mount -t proc /proc /fedora/proc
+	mount --make-rslave --rbind /sys /fedora/sys
+	mount --make-rslave --rbind /dev /fedora/dev
+	mount --make-rslave --rbind /run /fedora/run
+	mount --bind / /fedora/mnt
+}
+
+save_root_pass() {
+	grep '^root:' /etc/shadow > /fedora/root.passwd
+	chmod 0600 /fedora/root.passwd
+}
+
+backup_old_files() {
+	cp -Lp /etc/fstab /fedora/etc
+	if [ -d /root/.ssh ]; then
+		cp -Lpr /root/.ssh /fedora/key
+	fi
+}
+
+delete_all() {
+	# Delete *all* files from / except runtime mounts and bootstrap tree.
+	find / \( ! -path '/dev/*' -and ! -path '/proc/*' -and ! -path '/sys/*' -and ! -path '/run/*' -and ! -path '/selinux/*' -and ! -path '/fedora/*' -and ! -path '/fedora' -and ! -name '/swapfile' \) -delete 2>/dev/null || true
+}
+
+chroot_exec() {
+	"$ld" --library-path /fedora/lib64 \
+		/fedora/usr/sbin/chroot /fedora /bin/bash -c "$*"
+}
+
+install_packages() {
+	chroot_exec "dnf -y --nogpgcheck --installroot=/mnt --use-host-config install @core" || true
+	semodule -R || true
+	setfiles -e /fedora /etc/selinux/targeted/contexts/files/file_contexts / || true
+    dnf -y --nogpgcheck install @cloud-bootloader-tools kernel
+}
+
+restore_root_pass() {
+	if grep -E -q '^root:.?:' /fedora/root.passwd; then
+		echo "root:vps2fedora" | chpasswd
+	else
+		sed -i '/^root:/d' /etc/shadow
+		cat /fedora/root.passwd >> /etc/shadow
+	fi
+}
+
+cleanup() {
+	mv -f /fedora/etc/fstab /etc/fstab
+    mv -f /fedora/etc/resolv.conf /etc/resolv.conf
+	if [ -d /fedora/key ]; then
+		mv /fedora/key /root/.ssh
+	fi
+
+	awk '/\/fedora/ {print $2}' /proc/mounts | sort -r | xargs umount -nl 2>/dev/null || true
+	rm -rf /fedora
+}
+
+configure_bootloader() {
+	grub2-mkconfig -o /boot/grub2/grub.cfg
+}
+
+configure_network() {
+    for dev in $(ip -br l | awk '$2=="UP" {split($1, r, "@"); print r[1]}'); do
+		ip="$(ip -br a s "$dev" scope global | awk '{for(i=3;i<=NF;i++) printf "Address=%s\n", $i}')"
+        routes="$(ip -4 r s default; ip -6 r s default)"
+		gateway="$(echo "$routes" | awk -v dev="$dev" '$5 == dev {printf "Gateway=%s\n", $3}' | sort -u)"
+		{
+			echo "[Match]"
+			echo "Name=$dev"
+			echo
+			echo "[Network]"
+			echo "$ip"
+			echo "$gateway"
+		} > "/etc/systemd/network/$dev.network"
+	done
+	systemctl enable systemd-networkd
+	systemctl disable NetworkManager
+}
+
+finalize() {
+	cat > /etc/ssh/sshd_config.d/10-permit-root-login.conf <<-'EOF'
+		PermitRootLogin yes
+	EOF
+	setfiles /etc/selinux/targeted/contexts/files/file_contexts / || true
+	fixfiles -F onboot
+
+	cat <<-'EOF'
+		Hi,
+		your VM has successfully been reimaged with Fedora.
+
+		When you are finished with your post-installation, you'll need to reboot the VM the rough way:
+		# sync ; reboot -f
+
+		Then you'll be able to connect to your VM using SSH and to login using your old root password (or "vps2fedora" if you didn't have a root password).
+	EOF
+}
+
+architecture=$(uname -m)
+version=latest
+mirror=https://registry.fedoraproject.org
+ld=
+
+while getopts "v:a:m:h" opt; do
+	case "$opt" in
+	v)
+		version="$OPTARG"
+		;;
+	a)
+		architecture="$OPTARG"
+		;;
+	m)
+		mirror=$(printf '%s' "$OPTARG" | sed 's:/*$::')
+		;;
+	h)
+		cat <<-EOF
+			usage: ${0##*/} [options]
+
+			  Options:
+				-h                           Show help messages.
+				-v version                   Set Fedora version (Default: latest stable).
+				-a architecture              Set architecture (Default: auto detect).
+				-m mirror                    Set registry address (Default: https://registry.fedoraproject.org).
+		EOF
+		exit 0
+		;;
+	?)
+		printf "%s: invalid option -- '%s'\n" "${0##*/}" "$OPTARG" >&2
+		exit 1
+		;;
+	esac
+done
+shift $((OPTIND - 1))
+
+cd /
+download_and_extract_bootstrap
+save_root_pass
+backup_old_files
+delete_all
+install_packages
+restore_root_pass
+cleanup
+configure_bootloader
+configure_network
+finalize
