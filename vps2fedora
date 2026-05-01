@@ -136,6 +136,13 @@ cleanup() {
 }
 
 configure_bootloader() {
+	if [ -d /sys/firmware/efi ]; then
+		:
+	else
+		root_dev=$(findmnt -no SOURCE /)
+		root_dev=$(lsblk -npsro TYPE,NAME "$root_dev" | awk '$1 == "disk" {print $2}' | head -1)
+		/usr/sbin/grub2-install --recheck --force "$root_dev"
+	fi
 	grub2-mkconfig -o /boot/grub2/grub.cfg
 }
 
