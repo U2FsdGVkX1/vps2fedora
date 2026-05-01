@@ -110,6 +110,7 @@ chroot_exec() {
 
 install_packages() {
 	chroot_exec "dnf -y --nogpgcheck --installroot=/mnt --use-host-config install @core" || true
+	mv -f /fedora/etc/resolv.conf /etc/resolv.conf
 	semodule -R || true
 	setfiles -e /fedora /etc/selinux/targeted/contexts/files/file_contexts / || true
     dnf -y --nogpgcheck install @cloud-bootloader-tools kernel
@@ -126,7 +127,6 @@ restore_root_pass() {
 
 cleanup() {
 	mv -f /fedora/etc/fstab /etc/fstab
-    mv -f /fedora/etc/resolv.conf /etc/resolv.conf
 	if [ -d /fedora/key ]; then
 		mv /fedora/key /root/.ssh
 	fi
