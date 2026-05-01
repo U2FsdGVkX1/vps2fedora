@@ -136,6 +136,8 @@ cleanup() {
 }
 
 configure_bootloader() {
+	grep -q '^[[:space:]]*eth' /proc/net/dev && echo 'GRUB_CMDLINE_LINUX_DEFAULT="net.ifnames=0"' >> /etc/default/grub
+
 	if [ -d /sys/firmware/efi ]; then
 		:
 	else
