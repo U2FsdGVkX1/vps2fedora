@@ -30,19 +30,31 @@ fi
 
 download_and_extract_bootstrap() {
 	if [ "$version" = "latest" ]; then
-        tags_json=$(download "$mirror/v2/fedora/tags/list")
-		version=$(printf '%s\n' "$tags_json" \
+		tags_json=$(download "$mirror/v2/fedora/tags/list")
+		versions=$(printf '%s\n' "$tags_json" \
 			| grep -oE "\"[0-9]+-$architecture\"" \
 			| sed "s/\"//g;s/-$architecture//" \
-			| sort -n \
-			| tail -n1 || true)
-		if [ -z "$version" ]; then
-			version=$(printf '%s\n' "$tags_json" \
+			| sort -rn || true)
+		if [ -z "$versions" ]; then
+			versions=$(printf '%s\n' "$tags_json" \
 				| grep -oE '"[0-9]+"' \
 				| tr -d '"' \
-				| sort -n \
-				| tail -n1 || true)
+				| sort -rn || true)
 		fi
+
+		# The highest tag is rawhide, so find the one that "latest" points to
+		index_header='Accept: application/vnd.oci.image.index.v1+json'
+		latest_index=$(download "$mirror/v2/fedora/manifests/latest" "$index_header" || true)
+		version=
+		if [ -n "$latest_index" ]; then
+			for v in $versions; do
+				if [ "$(download "$mirror/v2/fedora/manifests/$v" "$index_header" || true)" = "$latest_index" ]; then
+					version=$v
+					break
+				fi
+			done
+		fi
+		[ -n "$version" ] || version=$(printf '%s\n' "$versions" | head -n1)
 	fi
 
 	manifest_tag="$version-$architecture"
