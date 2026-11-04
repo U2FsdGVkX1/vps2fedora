@@ -92,7 +92,7 @@ jobs:
       - name: Collect diagnostics
         if: failure()
         run: |
-          (echo 'screendump screen.png -f png'; sleep 2) | timeout 10 nc -NU mon.sock || true
+          (echo "screendump $PWD/screen.png -f png"; sleep 2) | timeout 10 nc -NU mon.sock || true
           tail -n 200 serial.log || true
 
       - if: always()
