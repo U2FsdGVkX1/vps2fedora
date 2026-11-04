@@ -166,6 +166,7 @@ configure_network() {
 		# Skip virtual devices such as docker0, veth* and bridges
 		[ -e "/sys/class/net/$dev/device" ] || continue
 		profile="/etc/NetworkManager/system-connections/$dev.nmconnection"
+		# shellcheck disable=SC2046
 		nmcli --offline connection add type ethernet con-name "$dev" ifname "$dev" \
 			$(ip_props "$dev" 4) $(ip_props "$dev" 6) > "$profile"
 		chmod 600 "$profile"
