@@ -1,0 +1,104 @@
+name: test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * 1'
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck vps2fedora
+
+  reinstall:
+    name: ${{ matrix.distro }} (${{ matrix.firmware }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        firmware: [bios, uefi]
+        distro: [debian-13, ubuntu-24.04, almalinux-9]
+        include:
+          - distro: debian-13
+            image: https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2
+          - distro: ubuntu-24.04
+            image: https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
+          - distro: almalinux-9
+            image: https://repo.almalinux.org/almalinux/9/cloud/x86_64/images/AlmaLinux-9-GenericCloud-latest.x86_64.qcow2
+    env:
+      SSH_OPTS: -i key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=5 -o ServerAliveInterval=10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable KVM and install QEMU
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils cloud-image-utils ovmf
+
+      - name: Prepare disk and cloud-init seed
+        run: |
+          curl -fsSL -o disk.qcow2 '${{ matrix.image }}'
+          qemu-img resize disk.qcow2 +8G
+          ssh-keygen -q -t ed25519 -N '' -f key
+          printf '#cloud-config\ndisable_root: false\nssh_authorized_keys: ["%s"]\n' "$(cat key.pub)" > user-data
+          cloud-localds seed.iso user-data
+          cp /usr/share/OVMF/OVMF_VARS_4M.fd vars.fd
+
+      - name: Boot VM
+        run: |
+          fw=
+          if [ '${{ matrix.firmware }}' = uefi ]; then
+            fw="-drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd -drive if=pflash,format=raw,file=vars.fd"
+          fi
+          qemu-system-x86_64 -enable-kvm -cpu host -m 2G -smp 2 $fw \
+            -drive file=disk.qcow2,if=virtio \
+            -drive file=seed.iso,if=virtio,format=raw \
+            -netdev user,id=n0,hostfwd=tcp::2222-:22 -device virtio-net-pci,netdev=n0 \
+            -display none -serial file:serial.log -monitor unix:mon.sock,server,nowait -daemonize
+
+      - name: Run vps2fedora
+        run: |
+          ssh_() { ssh $SSH_OPTS -p 2222 root@localhost "$@"; }
+          wait_ssh() { for _ in $(seq 120); do ssh_ true 2>/dev/null && return; sleep 5; done; return 1; }
+
+          wait_ssh
+          ssh_ 'cloud-init status --wait' || true
+          ssh_ 'cat /etc/os-release; lsblk; ip a; cat /etc/resolv.conf'
+          ssh_ 'command -v curl || command -v wget || { apt-get update && apt-get install -y curl; }'
+          scp $SSH_OPTS -P 2222 vps2fedora root@localhost:/root/
+          ssh_ 'sh /root/vps2fedora && sync && { (sleep 2; reboot -f) >/dev/null 2>&1 & }'
+
+      - name: Verify Fedora
+        run: |
+          ssh_() { ssh $SSH_OPTS -p 2222 root@localhost "$@"; }
+          wait_ssh() { for _ in $(seq 120); do ssh_ true 2>/dev/null && return; sleep 5; done; return 1; }
+
+          sleep 30
+          wait_ssh
+          ssh_ 'cat /etc/os-release; uname -r; cat /proc/cmdline; getenforce; lsblk; nmcli -t device; ip a'
+          ssh_ 'grep -qx ID=fedora /etc/os-release'
+          ssh_ "timeout 10 bash -c '</dev/tcp/fedoraproject.org/443'"
+          ssh_ 'timeout 300 systemctl is-system-running --wait || systemctl --failed'
+
+      - name: Collect diagnostics
+        if: failure()
+        run: |
+          (echo 'screendump screen.png -f png'; sleep 2) | timeout 10 nc -NU mon.sock || true
+          tail -n 200 serial.log || true
+
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-logs-${{ matrix.distro }}-${{ matrix.firmware }}
+          path: |
+            serial.log
+            screen.png
+          if-no-files-found: ignore
