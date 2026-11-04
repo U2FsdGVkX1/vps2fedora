@@ -11,7 +11,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: shellcheck vps2fedora
 
   reinstall:
@@ -33,7 +33,7 @@ jobs:
     env:
       SSH_OPTS: -i key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=5 -o ServerAliveInterval=10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Enable KVM and install QEMU
         run: |
@@ -85,6 +85,7 @@ jobs:
           wait_ssh
           ssh_ 'cat /etc/os-release; uname -r; cat /proc/cmdline; getenforce; lsblk; nmcli -t device; ip a'
           ssh_ 'grep -qx ID=fedora /etc/os-release'
+          ssh_ 'uname -r | grep -q "\.fc[0-9]"'
           ssh_ "timeout 10 bash -c '</dev/tcp/fedoraproject.org/443'"
           ssh_ 'timeout 300 systemctl is-system-running --wait || systemctl --failed'
 
@@ -95,7 +96,7 @@ jobs:
           tail -n 200 serial.log || true
 
       - if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: vm-logs-${{ matrix.distro }}-${{ matrix.firmware }}
           path: |
