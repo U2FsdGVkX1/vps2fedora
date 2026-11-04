@@ -162,7 +162,9 @@ ip_props() {
 }
 
 configure_network() {
-	for dev in $(ip -br l | awk '$2 == "UP" {sub(/@.*/, "", $1); print $1}'); do
+	for dev in $(ip -br l | awk '$2 == "UP" {print $1}'); do
+		# Skip virtual devices such as docker0, veth* and bridges
+		[ -e "/sys/class/net/$dev/device" ] || continue
 		profile="/etc/NetworkManager/system-connections/$dev.nmconnection"
 		nmcli --offline connection add type ethernet con-name "$dev" ifname "$dev" \
 			$(ip_props "$dev" 4) $(ip_props "$dev" 6) > "$profile"
