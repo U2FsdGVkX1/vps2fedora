@@ -148,22 +148,26 @@ configure_bootloader() {
 	grub2-mkconfig -o /boot/grub2/grub.cfg
 }
 
+ip_props() {
+	dev=$1 v=$2
+	addrs=$(ip -"$v" -o a s dev "$dev" scope global | awk '{print $4}' | paste -sd, -)
+	gateway=$(ip -"$v" r s default dev "$dev" | awk '$2 == "via" {print $3; exit}')
+	dns=$(awk -v v="$v" '$1 == "nameserver" && ($2 ~ /:/) == (v == 6) {print $2}' /etc/resolv.conf | paste -sd, -)
+
+	if [ -n "$addrs" ]; then
+		echo "ipv$v.method manual ipv$v.addresses $addrs"
+		echo "${gateway:+ipv$v.gateway $gateway}"
+	fi
+	echo "${dns:+ipv$v.dns $dns}"
+}
+
 configure_network() {
-    for dev in $(ip -br l | awk '$2=="UP" {split($1, r, "@"); print r[1]}'); do
-		ip="$(ip -br a s "$dev" scope global | awk '{for(i=3;i<=NF;i++) printf "Address=%s\n", $i}')"
-        routes="$(ip -4 r s default; ip -6 r s default)"
-		gateway="$(echo "$routes" | awk -v dev="$dev" '$5 == dev {printf "Gateway=%s\n", $3}' | sort -u)"
-		{
-			echo "[Match]"
-			echo "Name=$dev"
-			echo
-			echo "[Network]"
-			echo "$ip"
-			echo "$gateway"
-		} > "/etc/systemd/network/$dev.network"
+	for dev in $(ip -br l | awk '$2 == "UP" {sub(/@.*/, "", $1); print $1}'); do
+		profile="/etc/NetworkManager/system-connections/$dev.nmconnection"
+		nmcli --offline connection add type ethernet con-name "$dev" ifname "$dev" \
+			$(ip_props "$dev" 4) $(ip_props "$dev" 6) > "$profile"
+		chmod 600 "$profile"
 	done
-	systemctl enable systemd-networkd
-	systemctl disable NetworkManager
 }
 
 finalize() {
