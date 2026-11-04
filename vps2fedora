@@ -192,6 +192,11 @@ finalize() {
 	setfiles /etc/selinux/targeted/contexts/files/file_contexts / || true
 	fixfiles -F onboot
 
+	# GRUB does not replay the filesystem journal (e.g. XFS), so freeze /boot to
+	# write the new bootloader files in place before the user runs reboot -f
+	boot_mnt=$(findmnt -no TARGET -T /boot)
+	fsfreeze -f "$boot_mnt" && fsfreeze -u "$boot_mnt"
+
 	cat <<-'EOF'
 		Hi,
 		your VM has successfully been reimaged with Fedora.
